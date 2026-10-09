@@ -24,6 +24,7 @@
 import type { LanguageModelV2 } from "@ai-sdk/provider";
 import { wrapLanguageModel } from "ai";
 import { MemWal } from "../memwal.js";
+import { BackgroundSaves } from "./background-saves.js";
 import type { MemWalConfig, RecallMemory } from "../types.js";
 import {
     formatUntrustedMemories,
@@ -52,6 +53,14 @@ export interface WithMemWalOptions extends MemWalConfig {
     minRelevance?: number;
     /** Enable debug logging (default: false) */
     debug?: boolean;
+    /** Observe recall/auto-save errors without blocking generation. Error objects
+     * may contain private application data; redact them before external logging.
+     * Without a callback, a content-free warning is emitted even without debug.
+     */
+    onMemoryError?: (event: {
+        operation: "recall" | "autoSave";
+        error: unknown;
+    }) => void | Promise<void>;
 }
 
 // ============================================================
@@ -66,7 +75,7 @@ export interface WithMemWalOptions extends MemWalConfig {
  * - Recalls relevant memories (server: search → download → decrypt)
  * - Injects relevant memories as nonce-delimited, untrusted user data
  *
- * AFTER each LLM call:
+ * AFTER a call whose prompt ends with a new user message:
  * - Analyzes and saves important facts (server: LLM extract → embed → encrypt → Walrus → store)
  * - Fire-and-forget — does not block the response
  */
@@ -84,17 +93,28 @@ export function withMemWal(
         ? (...args: unknown[]) => console.warn("[Walrus Memory]", ...args)
         : () => { };
 
-    // Fire-and-forget auto-save writes are tracked here so short-lived
-    // callers (CLI scripts, serverless handlers) can await them via
-    // flush() before the process exits, instead of losing them silently.
-    const pendingSaves = new Set<Promise<unknown>>();
+    function reportMemoryError(operation: "recall" | "autoSave", error: unknown): void {
+        // Do not emit memory text, credentials, or raw relayer errors by default.
+        const warn = () => console.warn(
+            `[Walrus Memory] ${operation} failed; configure onMemoryError for details.`,
+        );
+        if (!options.onMemoryError) {
+            warn();
+            return;
+        }
+        try {
+            // Telemetry callbacks are observational, including async callbacks.
+            // Their failure must not break inference or create an unhandled rejection.
+            void Promise.resolve(options.onMemoryError({ operation, error })).catch(warn);
+        } catch {
+            warn();
+        }
+    }
+
+    const saves = new BackgroundSaves(error => reportMemoryError("autoSave", error));
 
     function saveInBackground(userMessage: string): void {
-        const savePromise = memwal
-            .analyze(userMessage)
-            .catch((err: unknown) => log("Auto-save failed:", err));
-        pendingSaves.add(savePromise);
-        savePromise.finally(() => pendingSaves.delete(savePromise));
+        saves.add(() => memwal.analyze(userMessage));
     }
 
     const wrapped = (wrapLanguageModel as any)({
@@ -128,7 +148,7 @@ export function withMemWal(
 
                     return { ...params, prompt: enrichedPrompt };
                 } catch (error) {
-                    log("Memory search failed:", error);
+                    reportMemoryError("recall", error);
                     return params;
                 }
             },
@@ -139,7 +159,7 @@ export function withMemWal(
             wrapGenerate: async ({ doGenerate, params }: any) => {
                 const result = await doGenerate();
 
-                if (autoSave) {
+                if (autoSave && isNewUserTurn(params.prompt)) {
                     const userMessage = findLastUserMessage(params.prompt);
                     if (userMessage) {
                         saveInBackground(userMessage);
@@ -153,7 +173,7 @@ export function withMemWal(
             wrapStream: async ({ doStream, params }: any) => {
                 const result = await doStream();
 
-                if (autoSave) {
+                if (autoSave && isNewUserTurn(params.prompt)) {
                     const userMessage = findLastUserMessage(params.prompt);
                     if (userMessage) {
                         saveInBackground(userMessage);
@@ -167,11 +187,10 @@ export function withMemWal(
 
     wrapped.specificationVersion = model.specificationVersion;
 
-    // Lets short-lived callers await outstanding auto-save writes before
-    // exiting, e.g. `await model.flush()` right before `process.exit()`.
-    wrapped.flush = async (): Promise<void> => {
-        await Promise.allSettled([...pendingSaves]);
-    };
+    // Call after generation/stream startup. Flush waits for pending analyze
+    // acceptance and rejects once for failures observed since the previous flush.
+    // Acceptance is not proof that the downstream Walrus jobs finished storing.
+    wrapped.flush = (): Promise<void> => saves.flush();
 
     return wrapped;
 }
@@ -179,6 +198,13 @@ export function withMemWal(
 // ============================================================
 // Helpers
 // ============================================================
+
+// AI SDK tool continuations end in assistant/tool messages. Only a prompt
+// ending in user input starts an auto-save; do not dedupe globally by text,
+// because equal text in a later independent user turn is still a new turn.
+function isNewUserTurn(prompt: unknown): boolean {
+    return Array.isArray(prompt) && prompt.at(-1)?.role === "user";
+}
 
 function findLastUserMessage(
     prompt: unknown
