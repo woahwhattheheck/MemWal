@@ -131,33 +131,62 @@ def _format_memories(
 
 
 class _PendingSaves:
-    """Tracks in-flight fire-and-forget auto-save work (asyncio Tasks and
-    background Threads) so a caller can drain it deterministically via
-    :meth:`flush`/:meth:`flush_sync` instead of losing it silently when the
-    process exits before it completes. Tasks scheduled via
-    ``loop.create_task()`` with no other reference are only weakly held by
-    the event loop and can be cancelled or garbage-collected before they
-    run — this keeps a strong reference until each one is done.
+    """Track fire-and-forget tasks/threads and preserve failed save outcomes.
+
+    Only the failure count is retained, never exception text or memory content.
+    Finished tasks and threads are discarded without losing their failure
+    result. The next flush consumes the result and raises once.
     """
 
     def __init__(self) -> None:
         self._tasks: "set[asyncio.Task[Any]]" = set()
         self._threads: List[threading.Thread] = []
         self._lock = threading.Lock()
+        self._failed_saves = 0
+
+    def _record_failure(self, error: BaseException) -> None:
+        with self._lock:
+            self._failed_saves += 1
+        logger.warning(
+            "Walrus Memory background auto-save failed (%s); flush will report it",
+            type(error).__name__,
+        )
+
+    def _raise_failed_saves(self) -> None:
+        with self._lock:
+            failed, self._failed_saves = self._failed_saves, 0
+        if failed:
+            raise RuntimeError(
+                f"Walrus Memory: {failed} background auto-save operation(s) "
+                "failed or were cancelled; memory may not have been persisted"
+            )
 
     def track_task(self, task: "asyncio.Task[Any]") -> None:
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        with self._lock:
+            self._tasks.add(task)
+
+        def _on_done(done: "asyncio.Task[Any]") -> None:
+            if done.cancelled():
+                self._record_failure(asyncio.CancelledError())
+            else:
+                try:
+                    error = done.exception()
+                except asyncio.CancelledError as cancelled:
+                    error = cancelled
+                if error is not None:
+                    self._record_failure(error)
+            with self._lock:
+                self._tasks.discard(done)
+
+        task.add_done_callback(_on_done)
 
     def spawn_thread(self, target: Callable[[], None]) -> None:
-        """Run `target` in a new daemon thread, tracked until it completes.
-        The thread untracks itself on completion -- a long-lived client
-        that keeps using fire-and-forget saves but never calls flush()
-        would otherwise accumulate one Thread object per save, forever.
-        """
+        """Untrack completed threads while retaining any failed save result."""
         def _run_and_untrack() -> None:
             try:
                 target()
+            except Exception as error:
+                self._record_failure(error)
             finally:
                 with self._lock:
                     if thread in self._threads:
@@ -169,41 +198,44 @@ class _PendingSaves:
         thread.start()
 
     async def flush(self) -> None:
-        """Await every pending task, then join every pending thread."""
-        if self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        """Await pending tasks, join threads and surface saved failures."""
+        with self._lock:
+            tasks = list(self._tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._join_threads()
+        self._raise_failed_saves()
 
     def flush_sync(self) -> None:
-        """Join every pending thread. A pending Task belongs to the loop
-        that created it (e.g. an earlier `await llm.ainvoke(...)` call) and
-        cannot be awaited from a different one -- if any are still pending
-        here, the caller mixed sync and async entry points on the same
-        wrapped client, and this cleanup path can't safely drain them. Log
-        and continue draining threads rather than raise out of what's
-        usually shutdown code."""
-        if self._tasks:
-            async def _drain(tasks: "list[asyncio.Task[Any]]") -> None:
-                await asyncio.gather(*tasks, return_exceptions=True)
+        """Join threads and surface failures from already-settled saves.
+
+        Tasks on another event loop cannot be awaited synchronously; retain
+        the historical warning when sync and async entry points are mixed.
+        """
+        with self._lock:
+            tasks = list(self._tasks)
+        if tasks:
+            async def _drain(pending_tasks: "list[asyncio.Task[Any]]") -> None:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
 
             try:
-                asyncio.run(_drain(list(self._tasks)))
+                asyncio.run(_drain(tasks))
             except RuntimeError:
                 logger.warning(
                     "Walrus Memory flush_sync() could not await %d pending "
                     "task(s) bound to a different event loop (mixing sync "
                     "and async calls on the same wrapped client?) — those "
                     "saves may be lost.",
-                    len(self._tasks),
+                    len(tasks),
                 )
         self._join_threads()
+        self._raise_failed_saves()
 
     def _join_threads(self) -> None:
         with self._lock:
             threads, self._threads = self._threads, []
         for thread in threads:
             thread.join()
-
 
 def _expose_memwal_controls(obj: Any, memwal: MemWal, pending: _PendingSaves) -> None:
     """Attach the underlying client and a way to drain pending auto-saves —
@@ -253,8 +285,8 @@ def _fire_and_forget(coro: Any, pending: _PendingSaves, label: str = "auto-save"
         def _run() -> None:
             try:
                 asyncio.run(coro)
-            except Exception:
-                logger.debug("Fire-and-forget analyze() failed", exc_info=True)
+            except Exception as error:
+                pending._record_failure(error)
 
         pending.spawn_thread(_run)
 
@@ -387,7 +419,8 @@ def with_memwal_langchain(
             try:
                 await memwal.analyze(user_text, namespace)
             except Exception as e:
-                log(f"[Walrus Memory] Auto-save failed: {e}")
+                pending._record_failure(e)
+                log(f"[Walrus Memory] Auto-save failed ({type(e).__name__})")
 
     async def patched_agenerate(
         messages: List[List[BaseMessage]], *args: Any, **kwargs: Any
@@ -551,7 +584,8 @@ def _wrap_async_openai(
                 try:
                     await memwal.analyze(user_text, namespace)
                 except Exception as e:
-                    log(f"[Walrus Memory] Auto-save failed: {e}")
+                    pending._record_failure(e)
+                log(f"[Walrus Memory] Auto-save failed ({type(e).__name__})")
 
             _fire_and_forget(_analyze(), pending)
 
@@ -612,7 +646,8 @@ def _wrap_sync_openai(
                 try:
                     _run_memwal(lambda: memwal.analyze(user_text, namespace))
                 except Exception as e:
-                    log(f"[Walrus Memory] Auto-save failed: {e}")
+                    pending._record_failure(e)
+                log(f"[Walrus Memory] Auto-save failed ({type(e).__name__})")
 
             pending.spawn_thread(_analyze)
 
