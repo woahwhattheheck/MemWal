@@ -585,7 +585,7 @@ def _wrap_async_openai(
                     await memwal.analyze(user_text, namespace)
                 except Exception as e:
                     pending._record_failure(e)
-                log(f"[Walrus Memory] Auto-save failed ({type(e).__name__})")
+                    log(f"[Walrus Memory] Auto-save failed ({type(e).__name__})")
 
             _fire_and_forget(_analyze(), pending)
 
@@ -647,7 +647,7 @@ def _wrap_sync_openai(
                     _run_memwal(lambda: memwal.analyze(user_text, namespace))
                 except Exception as e:
                     pending._record_failure(e)
-                log(f"[Walrus Memory] Auto-save failed ({type(e).__name__})")
+                    log(f"[Walrus Memory] Auto-save failed ({type(e).__name__})")
 
             pending.spawn_thread(_analyze)
 
