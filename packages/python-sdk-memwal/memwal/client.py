@@ -34,6 +34,8 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from math import isfinite
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypeVar, Union
 from urllib.parse import ParseResult, urlencode, urlparse
 
@@ -184,18 +186,40 @@ def _polling_delay_ms(base_ms: int, attempt: int) -> int:
 def _positive_retry_ms(raw: object) -> Optional[int]:
     try:
         seconds = float(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    if seconds <= 0 or seconds != seconds or seconds == float("inf"):
+    # Validate the converted value too: a finite seconds float can overflow
+    # during the milliseconds multiplication (e.g. Retry-After: 1e308).
+    milliseconds = seconds * 1000
+    if seconds <= 0 or not isfinite(milliseconds):
         return None
-    return int(seconds * 1000)
+    return int(milliseconds)
+
+
+def _retry_after_http_date_ms(raw: object) -> Optional[int]:
+    """Convert an RFC 9110 HTTP-date Retry-After value to milliseconds."""
+
+    if not isinstance(raw, str) or len(raw) > 128:
+        return None
+    try:
+        target = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if target.tzinfo is None:
+        return None
+    remaining = (target.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds() * 1000
+    if remaining <= 0 or not isfinite(remaining):
+        return None
+    return max(1, int(remaining))
 
 
 def _retry_after_ms(err: "_HttpStatusError") -> int:
-    """Retry-After seconds, else JSON ``retry_after_seconds``, in ms."""
+    """Honor Retry-After delta-seconds or HTTP-date, then JSON fallback (ms)."""
 
     if err.retry_after:
         header_ms = _positive_retry_ms(err.retry_after)
+        if header_ms is None:
+            header_ms = _retry_after_http_date_ms(err.retry_after)
         if header_ms is not None:
             return header_ms
     if not err.body:
